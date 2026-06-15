@@ -180,17 +180,70 @@ class Browser:
         request_kwargs.update(kwargs)
         return request_kwargs
 
+    @staticmethod
+    def _is_disabled(tag):
+        """Check if a form control is disabled per the HTML spec.
+
+        A control is disabled if it has the disabled attribute, or if it
+        is a descendant of a disabled fieldset and NOT a descendant of
+        that fieldset's first legend element child.
+        """
+        if tag.has_attr('disabled'):
+            return True
+        for ancestor in tag.parents:
+            if ancestor.name == 'fieldset' and ancestor.has_attr('disabled'):
+                first_legend = ancestor.find('legend', recursive=False)
+                if first_legend is not None:
+                    # Check if tag is a descendant of the first legend
+                    in_legend = False
+                    for p in tag.parents:
+                        if p is first_legend:
+                            in_legend = True
+                            break
+                        if p is ancestor:
+                            break
+                    if in_legend:
+                        continue  # not disabled by this fieldset
+                return True
+        return False
+
+    @staticmethod
+    def _option_is_disabled(option):
+        """Check if an option element is disabled per the HTML spec.
+
+        An option is disabled if it has the disabled attribute, or if
+        its parent is an optgroup with the disabled attribute.
+        """
+        if option.has_attr('disabled'):
+            return True
+        parent = option.parent
+        if (parent is not None
+                and parent.name == 'optgroup'
+                and parent.has_attr('disabled')):
+            return True
+        return False
+
     @classmethod
     def get_request_kwargs(cls, form, url=None, **kwargs):
         """Extract input data from the form."""
         method = str(form.get("method", "get"))
         action = form.get("action")
 
-        # If the form has a submit button, use its form action
-        # https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/button#formaction.
-        button_submit_element = form.find("button")
-        if button_submit_element:
-            action = button_submit_element.get("formaction", action)
+        # Find the chosen submit element (after choose_submit has run,
+        # only the chosen one remains).  Honour its formaction,
+        # formmethod and formenctype overrides per the HTML spec.
+        # https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/button#formaction
+        submit_el = None
+        for el in form.select(
+            'input[type="submit" i], button'
+        ):
+            if el.get("type", "").lower() not in ('button', 'reset'):
+                submit_el = el
+                break
+
+        if submit_el is not None:
+            action = submit_el.get("formaction", action)
+            method = str(submit_el.get("formmethod", method))
 
         url = urllib.parse.urljoin(url, action)
         if url is None:  # This happens when both `action` and `url` are None.
@@ -207,7 +260,13 @@ class Browser:
         # Requests also retains order when encoding form data in 2-tuple lists.
         data = [(k, v) for k, v in data.items()]
 
-        multipart = form.get("enctype", "") == "multipart/form-data"
+        # Determine enctype: submit button's formenctype overrides form's
+        if submit_el is not None:
+            enctype = submit_el.get(
+                "formenctype", form.get("enctype", ""))
+        else:
+            enctype = form.get("enctype", "")
+        multipart = enctype == "multipart/form-data"
 
         # Process form tags in the order that they appear on the page,
         # skipping those tags that do not have a name-attribute.
@@ -217,7 +276,9 @@ class Browser:
             name = tag.get("name")  # name-attribute of tag
 
             # Skip disabled elements, since they should not be submitted.
-            if tag.has_attr('disabled'):
+            # This checks both the disabled attribute and disabled fieldset
+            # ancestry (with the first-legend exception per HTML spec).
+            if cls._is_disabled(tag):
                 continue
 
             if tag.name == "input":
@@ -259,9 +320,14 @@ class Browser:
             elif tag.name == "select":
                 # If the value attribute is not specified, the content will
                 # be passed as a value instead.
+                # Per the HTML spec, disabled options and options inside
+                # disabled optgroups are not successful controls.
                 options = tag.select("option")
-                selected_values = [i.get("value", i.text) for i in options
-                                   if "selected" in i.attrs]
+                selected_values = [
+                    i.get("value", i.text) for i in options
+                    if "selected" in i.attrs
+                    and not cls._option_is_disabled(i)
+                ]
                 if "multiple" in tag.attrs:
                     for value in selected_values:
                         data.append((name, value))
@@ -270,9 +336,12 @@ class Browser:
                     # selected, but browsers pick last if somehow multiple.
                     data.append((name, selected_values[-1]))
                 elif options:
-                    # Selects the first option if none are selected
-                    first_value = options[0].get("value", options[0].text)
-                    data.append((name, first_value))
+                    # Fallback: first non-disabled option
+                    for opt in options:
+                        if not cls._option_is_disabled(opt):
+                            first_val = opt.get("value", opt.text)
+                            data.append((name, first_val))
+                            break
 
         if method.lower() == "get":
             kwargs["params"] = data
